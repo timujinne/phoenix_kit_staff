@@ -20,6 +20,22 @@ defmodule PhoenixKitStaff.Attachments do
   them — mirroring `PhoenixKitCatalogue.Attachments`' write semantics
   (soft-trash a sole-owner file, unlink a shared one). It never hard-deletes
   a possibly-shared asset.
+
+  ## Parent folder
+
+  By default a person's folder is created at the storage root. A host can
+  group them:
+
+      config :phoenix_kit_staff, :attachments_parent_folder, {MyApp.Media, :parent_for}
+
+  called as `parent_for(:person, actor_uuid, person_uuid)` (or
+  `parent_for(:person, actor_uuid)`), returning `{:ok, parent_folder_uuid}` or
+  `nil` (root). The hook only decides where a **new** root folder is created.
+  Lookups don't depend on its answer: the root folder name embeds the person
+  uuid, so it is resolved by name — under the configured parent first, then at
+  the root (folders that predate the setting), then under any other parent
+  (the hook's answer changed, e.g. it varies by actor). Purge removes every
+  folder carrying the name.
   """
 
   require Logger
@@ -49,12 +65,14 @@ defmodule PhoenixKitStaff.Attachments do
   nested `Images` subfolder) **without creating** it. Returns the uuid or
   `nil` (used on render so viewing a tab doesn't spawn empty folders).
   """
-  @spec folder_uuid(binary(), :files | :images) :: binary() | nil
-  def folder_uuid(person_uuid, :files),
-    do: uuid_of(get_folder(root_folder_name(person_uuid), nil))
+  @spec folder_uuid(binary(), :files | :images, binary() | nil) :: binary() | nil
+  def folder_uuid(person_uuid, kind, actor_uuid \\ nil)
 
-  def folder_uuid(person_uuid, :images) do
-    case get_folder(root_folder_name(person_uuid), nil) do
+  def folder_uuid(person_uuid, :files, actor_uuid),
+    do: uuid_of(get_root_folder(person_uuid, actor_uuid))
+
+  def folder_uuid(person_uuid, :images, actor_uuid) do
+    case get_root_folder(person_uuid, actor_uuid) do
       %Folder{uuid: root} -> uuid_of(get_folder(@images_folder_name, root))
       _ -> nil
     end
@@ -69,17 +87,21 @@ defmodule PhoenixKitStaff.Attachments do
   @spec ensure_folder(binary(), :files | :images, binary() | nil) ::
           {:ok, binary()} | {:error, term()}
   def ensure_folder(person_uuid, :files, actor_uuid) do
-    find_or_create(root_folder_name(person_uuid), nil, actor_uuid)
+    name = root_folder_name(person_uuid)
+    parent_uuid = parent_folder_uuid(:person, actor_uuid, person_uuid)
+    find_or_create(name, parent_uuid, actor_uuid, fn -> find_root_folder(name, parent_uuid) end)
   end
 
   def ensure_folder(person_uuid, :images, actor_uuid) do
-    with {:ok, root} <- find_or_create(root_folder_name(person_uuid), nil, actor_uuid) do
-      find_or_create(@images_folder_name, root, actor_uuid)
+    with {:ok, root} <- ensure_folder(person_uuid, :files, actor_uuid) do
+      find_or_create(@images_folder_name, root, actor_uuid, fn ->
+        get_folder(@images_folder_name, root)
+      end)
     end
   end
 
-  defp find_or_create(name, parent_uuid, user_uuid) do
-    case get_folder(name, parent_uuid) do
+  defp find_or_create(name, parent_uuid, user_uuid, lookup) do
+    case lookup.() do
       %Folder{uuid: uuid} ->
         {:ok, uuid}
 
@@ -91,7 +113,7 @@ defmodule PhoenixKitStaff.Attachments do
           # Lost the create race against a concurrent first-upload — the
           # unique [:name, :parent_uuid] constraint rejected us; re-resolve.
           {:error, %Ecto.Changeset{}} ->
-            case get_folder(name, parent_uuid) do
+            case lookup.() do
               %Folder{uuid: uuid} -> {:ok, uuid}
               _ -> {:error, :folder_unavailable}
             end
@@ -103,13 +125,70 @@ defmodule PhoenixKitStaff.Attachments do
       {:error, :folder_unavailable}
   end
 
-  defp get_folder(name, nil) do
-    from(f in Folder, where: f.name == ^name and is_nil(f.parent_uuid), limit: 1) |> repo().one()
+  @doc false
+  # Host-configured parent folder for `:person`; `nil` = storage root (default).
+  # Contract: `fun(:person, actor_uuid, subject)` (preferred) or `fun(:person, actor_uuid)`;
+  # `subject` is the person uuid.
+  def parent_folder_uuid(kind, actor_uuid, subject \\ nil) do
+    case Application.get_env(:phoenix_kit_staff, :attachments_parent_folder) do
+      {mod, fun} when is_atom(mod) and is_atom(fun) ->
+        result =
+          cond do
+            Code.ensure_loaded?(mod) and function_exported?(mod, fun, 3) ->
+              apply(mod, fun, [kind, actor_uuid, subject])
+
+            Code.ensure_loaded?(mod) and function_exported?(mod, fun, 2) ->
+              apply(mod, fun, [kind, actor_uuid])
+
+            true ->
+              nil
+          end
+
+        case result do
+          {:ok, uuid} when is_binary(uuid) -> uuid
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    error ->
+      Logger.warning("[Staff] parent folder hook failed for #{inspect(kind)}: #{inspect(error)}")
+      nil
+  catch
+    :exit, reason ->
+      Logger.warning("[Staff] parent folder hook exited for #{inspect(kind)}: #{inspect(reason)}")
+      nil
+  end
+
+  defp get_root_folder(person_uuid, actor_uuid) do
+    find_root_folder(
+      root_folder_name(person_uuid),
+      parent_folder_uuid(:person, actor_uuid, person_uuid)
+    )
+  end
+
+  # The root name embeds the person uuid, so every folder carrying it is this
+  # person's wherever it sits. Prefer the configured parent, then the root
+  # (folders that predate the hook), then any other parent (the hook's answer
+  # changed, e.g. it varies by actor) — oldest first within a rank, so the
+  # answer never depends on who is asking.
+  defp find_root_folder(name, parent_uuid) do
+    from(f in Folder, where: f.name == ^name, order_by: [asc: f.uuid])
+    |> repo().all()
+    |> Enum.min_by(&root_rank(&1, parent_uuid), fn -> nil end)
   rescue
     error ->
       Logger.warning("[Staff] get_folder #{name} failed: #{inspect(error)}")
       nil
   end
+
+  defp root_rank(%Folder{parent_uuid: parent_uuid}, parent_uuid) when is_binary(parent_uuid),
+    do: 0
+
+  defp root_rank(%Folder{parent_uuid: nil}, _), do: 1
+  defp root_rank(%Folder{}, _), do: 2
 
   defp get_folder(name, parent_uuid) do
     from(f in Folder, where: f.name == ^name and f.parent_uuid == ^parent_uuid, limit: 1)
@@ -269,20 +348,20 @@ defmodule PhoenixKitStaff.Attachments do
   @doc """
   Permanently purges a person's media — deletes the root folder and its whole
   subtree (the nested `Images` folder + every file, including bucket copies)
-  via core's cascading `delete_folder_completely/1`. Best-effort: logs and
-  returns `:ok` on any failure so it never blocks a person deletion. Call
-  only on a **permanent** delete (soft-trash keeps the files).
+  via core's cascading `delete_folder_completely/1`. Every folder named
+  `staff-person-<uuid>` goes, wherever it sits, so it neither consults the
+  parent-folder hook nor misses a folder created under an earlier answer.
+  Best-effort: logs and returns `:ok` on any failure so it never blocks a
+  person deletion. Call only on a **permanent** delete (soft-trash keeps the
+  files).
   """
   @spec purge_person_media(binary()) :: :ok
   def purge_person_media(person_uuid) do
-    case get_folder(root_folder_name(person_uuid), nil) do
-      %Folder{} = folder ->
-        Storage.delete_folder_completely(folder)
-        :ok
+    name = root_folder_name(person_uuid)
 
-      _ ->
-        :ok
-    end
+    from(f in Folder, where: f.name == ^name)
+    |> repo().all()
+    |> Enum.each(&Storage.delete_folder_completely/1)
   rescue
     error ->
       Logger.warning("[Staff] purge_person_media #{person_uuid} failed: #{inspect(error)}")
