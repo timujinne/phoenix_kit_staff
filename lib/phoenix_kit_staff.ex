@@ -87,6 +87,12 @@ defmodule PhoenixKitStaff do
   @impl PhoenixKit.Module
   def css_sources, do: [:phoenix_kit_staff]
 
+  # PhoenixKit.Module.media_reorganizer/0 (core 2.24+). No `@impl`: the core
+  # pin (~> 2.0) still admits cores without the callback, where `@impl` would
+  # warn. `ModuleRegistry.all_media_reorganizers/0` looks this function up by
+  # name, not by behaviour, so it is collected either way.
+  def media_reorganizer, do: PhoenixKitStaff.MediaReorganizer
+
   @impl PhoenixKit.Module
   def admin_tabs do
     parent = [
